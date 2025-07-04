@@ -1,12 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
-import { OpenAI } from "openai";
-import { Ai } from '@cloudflare/ai';
+import { z } from 'zod';
+import { Buffer } from 'buffer';
 
-interface ChatMessage {
-    role: 'user' | 'assistant';
-    content: string;
-    timestamp: string;
-}
+const messageSchema = z.object({
+    text: z.string().optional(),
+    image: z.any().optional(),
+    audio: z.any().optional(), 
+    search: z.boolean().default(false),
+});
 
 interface Env {
     MY_DURABLE_OBJECT: DurableObjectNamespace;
@@ -17,36 +18,122 @@ interface Env {
 
 export class MyDurableObject extends DurableObject {
     webSockets: Set<WebSocket>;
-    messages: ChatMessage[];
     state: DurableObjectState;
     env: Env;
+    ai: any;
+    
+    audioTranscription: Array<{
+        role: 'user' | 'assistant' | 'system';
+        content: string;
+    }>;
 
     constructor(state: DurableObjectState, env: Env) {
         super(state, env);
         this.state = state;
         this.env = env;
         this.webSockets = new Set();
-        this.messages = [];
-        
-        
-        // Load messages from storage if available
-        state.blockConcurrencyWhile(async () => {
-            const stored = await state.storage.get<ChatMessage[]>('messages');
-            if (stored) this.messages = stored;
-        });
+        this.ai = this.env.AI;
+        this.audioTranscription = [
+            { role: 'system', content: 'You are a helpful assistant.' }
+        ];
+    }
+
+    addMessage(content: string, role: 'user' | 'assistant' | 'system' = 'user') {
+        const message = { role, content };
+        this.audioTranscription.push(message);
+        return message;
+    }
+
+    getMessages() {
+        return [...this.audioTranscription];
+    }
+
+    async handleMessage(websocket: WebSocket, message: any) {
+        if (message.audio) {
+            const startTime = Date.now();
+            console.log("Received audio data");
+            const audioBase64 = message.audio;
+            
+            try {
+                // Transcription phase
+                console.time('Whisper Transcription');
+                const response = await this.ai.run("@cf/openai/whisper-large-v3-turbo", {
+                    audio: audioBase64,
+                });
+                console.timeEnd('Whisper Transcription');
+                
+                console.log("Transcription: Completed:", response.text);
+                
+                // Summary generation phase
+                console.time('LLaMA Summary Generation');
+                console.log("Generating Summary...");
+                const stream = await this.ai.run("@cf/meta/llama-3.2-11b-vision-instruct", {
+                    messages: [
+                        {role: "system", content: "You are a helpful assistant. You need to output the transcript prefixing the USER SAYS:"},
+                        {role: 'user', content: response.text}
+                    ],
+                    stream: false,
+                });
+                console.timeEnd('LLaMA Summary Generation');
+
+                // Calculate and log total time
+                const totalTime = Date.now() - startTime;
+                console.log(`\n=== Processing Summary ===`);
+                console.log(`- Transcription: ${response.text.length} characters`);
+                console.log(`- Total Processing Time: ${totalTime}ms`);
+                console.log(`=== End Summary ===\n`);
+
+                console.log("Summary: Completed:", stream);
+                // for await (const chunk of stream) {
+                //     const content = chunk.choices[0]?.delta?.content || '';
+                //     if (content) {
+                        
+                //     }
+                // }              
+
+
+                
+                websocket.send(JSON.stringify({
+                    type: 'transcription',
+                    text: response.text,
+                    status: 'completed'
+                }));
+                
+            } catch (error) {
+                console.error("Error processing audio data:", error);
+                websocket.send(JSON.stringify({
+                    type: 'error',
+                    message: error instanceof Error ? error.message : 'Failed to process audio',
+                    status: 'error'
+                }));
+            }
+            
+        }
+
+        else if (message.text) {
+            console.log("Received text message");
+
+            try {
+                const response = await this.ai.run("@cf/meta/llama-3.2-11b-vision-instruct", {
+                    messages: this.getMessages(),
+                });
+                
+                console.log("Response:", response);
+                
+            } catch (error) {
+                console.error("Error processing text message:", error);
+                websocket.send(JSON.stringify({
+                    type: 'error',
+                    message: error instanceof Error ? error.message : 'Failed to process text message',
+                    status: 'error'
+                }));
+            }
+        }
+
     }
     
-
     async fetch(request: Request): Promise<Response> {
-        const url = new URL(request.url);
-        
-        if (url.pathname.endsWith('/messages')) {
-            return new Response(JSON.stringify({
-                messages: this.messages
-            }), {
-                headers: { 'Content-Type': 'application/json' }
-            });
-        }
+        // const url = new URL(request.url);
 
         const webSocketPair = new WebSocketPair();
         const [client, server] = Object.values(webSocketPair);
@@ -55,96 +142,138 @@ export class MyDurableObject extends DurableObject {
         this.webSockets.add(server);
 
         server.addEventListener('message', async (event) => {
-            if (event.data instanceof ArrayBuffer) {
-                try {
-                    console.log("Received audio data, size:", event.data.byteLength, "bytes");
-                    const audioData = new Uint8Array(event.data);
+
+            // console.log("Received message:", event.data);
+        
+            const messageData = typeof event.data === 'string' 
+            ? JSON.parse(event.data) 
+            : event.data;
+         
+
+            // const message = messageSchema.safeParse(messageData);
+            // console.log("Parsed message:", message.success);
+            // console.log("Parsed message data:", message.data);
+
+            this.handleMessage(server, messageData);
+            // if (message.success) {
+            //     this.handleMessage(server, message.data);                
+            // }
+
+            // else {
+            //     server.send(JSON.stringify({
+            //         type: 'error',
+            //         message: 'Invalid message format',
+            //         status: 'error'
+            //     }));
+            // }
+            
+            // if (message.type === 'text') {
+            //     console.log("Received text message:");
+            // }
+
+            // else if (message.type === 'image') {
+            //     console.log("Received image data, size:");
+            // }
+
+            // else if (message.type === 'audio') {
+            //     console.log("Received audio data, size:");
+            // }
+            // else {
+            //     console.log("Received unknown message type:");
+            // }
+
+
+            // if (event.data instanceof ArrayBuffer) {
+            //     try {
+            //         console.log("Received audio data, size:", event.data.byteLength, "bytes");
+            //         const audioData = new Uint8Array(event.data);
                     
-                    // Send acknowledgment to client
-                    server.send(JSON.stringify({
-                        type: 'status',
-                        message: 'Processing audio...',
-                        status: 'processing'
-                    }));
+            //         // Send acknowledgment to client
+            //         server.send(JSON.stringify({
+            //             type: 'status',
+            //             message: 'Processing audio...',
+            //             status: 'processing'
+            //         }));
                     
-                    // Initialize AI binding
-                    const ai = new Ai(this.env.AI);
+            //         // Initialize AI binding
+            //         const ai = new Ai(this.env.AI);
                     
-                    // Process audio in chunks if it's too large (e.g., > 1MB)
-                    const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
-                    let transcription = "";
+            //         // Process audio in chunks if it's too large (e.g., > 1MB)
+            //         const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+            //         let transcription = "";
                     
-                    for (let i = 0; i < audioData.length; i += CHUNK_SIZE) {
-                        const chunk = audioData.slice(i, i + CHUNK_SIZE);
+            //         for (let i = 0; i < audioData.length; i += CHUNK_SIZE) {
+            //             const chunk = audioData.slice(i, i + CHUNK_SIZE);
                         
-                        try {
-                            const response = await ai.run('@cf/openai/whisper', {
-                                audio: [...chunk],
-                            });
+            //             try {
+            //                 const response = await ai.run('@cf/openai/whisper', {
+            //                     audio: [...chunk],
+            //                 });
 
 
                             
-                            if (response.text) {
-                                const chunkText = response.text.trim();
-                                if (chunkText) {
-                                    console.log(`Processed chunk ${Math.floor(i/CHUNK_SIZE) + 1}`);
-                                    transcription += chunkText + " ";
+            //                 if (response.text) {
+            //                     const chunkText = response.text.trim();
+            //                     if (chunkText) {
+            //                         console.log(`Processed chunk ${Math.floor(i/CHUNK_SIZE) + 1}`);
+            //                         transcription += chunkText + " ";
                                     
-                                    // Send partial transcription
-                                    server.send(JSON.stringify({
-                                        type: 'transcription_partial',
-                                        text: chunkText,
-                                        isFinal: (i + CHUNK_SIZE) >= audioData.length
-                                    }));
-                                }
-                            }
-                        } catch (chunkError) {
-                            console.error('Error processing audio chunk:', chunkError);
-                            // Continue with next chunk even if one fails
-                        }
-                    }
+            //                         // Send partial transcription
+            //                         server.send(JSON.stringify({
+            //                             type: 'transcription_partial',
+            //                             text: chunkText,
+            //                             isFinal: (i + CHUNK_SIZE) >= audioData.length
+            //                         }));
+            //                     }
+            //                 }
+            //             } catch (chunkError) {
+            //                 console.error('Error processing audio chunk:', chunkError);
+            //                 // Continue with next chunk even if one fails
+            //             }
+            //         }
                     
-                    transcription = transcription.trim();
-                    if (!transcription) {
-                        console.log('No speech was detected in any audio chunk');
-                        transcription = "No speech detected or could not process audio";
-                    } else {
-                        console.log('Transcription completed successfully');
-                    }
+            //         transcription = transcription.trim();
+            //         if (!transcription) {
+            //             console.log('No speech was detected in any audio chunk');
+            //             transcription = "No speech detected or could not process audio";
+            //         } else {
+            //             console.log('Transcription completed successfully');
+            //         }
                     
-                    console.log('Transcription complete');
-                    console.log('Transcription:', transcription);
-                    server.send(JSON.stringify({
-                        type: 'transcription',
-                        text: transcription,
-                        status: 'completed'
-                    }));
+            //         console.log('Transcription complete');
+            //         console.log('Transcription:', transcription);
+            //         server.send(JSON.stringify({
+            //             type: 'transcription',
+            //             text: transcription,
+            //             status: 'completed'
+            //         }));
+
 
 
                     
 
-                } catch (error) {
-                    console.error('Error processing audio:', error);
-                    try {
-                        server.send(JSON.stringify({
-                            type: 'error',
-                            message: error instanceof Error ? error.message : 'Failed to process audio',
-                            status: 'error'
-                        }));
-                    } catch (sendError) {
-                        console.error('Failed to send error to client:', sendError);
-                    }
-                }
-                return;
-            }
+            //     } catch (error) {
+            //         console.error('Error processing audio:', error);
+            //         try {
+            //             server.send(JSON.stringify({
+            //                 type: 'error',
+            //                 message: error instanceof Error ? error.message : 'Failed to process audio',
+            //                 status: 'error'
+            //             }));
+            //         } catch (sendError) {
+            //             console.error('Failed to send error to client:', sendError);
+            //         }
+            //     }
+            //     return;
+            // }
 
-            else {
-                server.send(JSON.stringify({
-                    type: 'error',
-                    message: 'Unsupported message type',
-                    status: 'error'
-                }));
-            }
+            // else {
+            //     server.send(JSON.stringify({
+            //         type: 'error',
+            //         message: 'Unsupported message type',
+            //         status: 'error'
+            //     }));
+            // }
             
             
             
@@ -229,11 +358,7 @@ export class MyDurableObject extends DurableObject {
             //         totalTime: totalLatency.toFixed(2)
             //     }));
                 
-            // } catch (error) {
-            //     const errorTime = performance.now();
-            //     console.error(`Error after ${(errorTime - startTime).toFixed(2)}ms:`, error);
-            //     server.send('Error processing your request');
-            // }
+
     });
 
         server.addEventListener('close', () => {
@@ -245,45 +370,23 @@ export class MyDurableObject extends DurableObject {
             webSocket: client,
         });
     }
+
+
+
+    
 }
+
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext) {
         const url = new URL(request.url);
         
-        // Handle WebSocket connections
         if (url.pathname === '/ws') {
             const id = env.MY_DURABLE_OBJECT.idFromName("websocket");
             const stub = env.MY_DURABLE_OBJECT.get(id);
             return stub.fetch(request);
         }
-        
-        if (url.pathname === '/messages') {
-            const id = env.MY_DURABLE_OBJECT.idFromName("websocket");
-            const stub = env.MY_DURABLE_OBJECT.get(id);
-            
-            try {
-                // Forward the request to the Durable Object
-                const response = await stub.fetch(new Request(url, {
-                    method: 'GET',
-                    headers: request.headers
-                }));
-                
-                // Return the messages from the Durable Object's response
-                const messages = await response.json();
-                return new Response(JSON.stringify(messages), {
-                    headers: { 'Content-Type': 'application/json' }
-                });
-            } catch (error) {
-                return new Response(JSON.stringify({
-                    error: 'Failed to fetch messages',
-                    details: error instanceof Error ? error.message : String(error)
-                }), { 
-                    status: 500,
-                    headers: { 'Content-Type': 'application/json' }
-                });
-            }
-        }
+               
         
     }
 }

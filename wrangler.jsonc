@@ -6,7 +6,10 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "cluely-cf",
   "main": "src/index.ts",
-  "compatibility_date": "2025-06-28",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "compatibility_date": "2025-07-04",
   
   // AI Binding
   "ai": {
