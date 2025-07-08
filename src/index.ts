@@ -35,28 +35,80 @@ export class MyDurableObject extends DurableObject {
 
     async handleAudioMessage(websocket: WebSocket, message: any) {
         if (message) {
-            console.log("Received audio data");
-            const audioBase64 = message;
-            
+
+
+
+
+
+
             try {
+          
+                // console.log("Received audio data", message);
+                // console.log("Type of message", typeof message);
+                const pcmData = new Int16Array(message);
+                const wavBuffer = this.createWavBuffer(pcmData, {
+                    sampleRate: 24000,  // Must match client's sample rate
+                    numChannels: 1,     // Mono
+                    bitDepth: 16        // 16-bit PCM
+                });
+                
+                const audioArray = Array.from(new Uint8Array(wavBuffer));
+                const input = {
+                    audio: audioArray
+                };
+        
+
+                // const audioData = [...new Uint8Array(message)];
+    
+                const resp = await this.env.AI.run("@cf/openai/whisper", input);
+                
+                console.log("Response received", resp.text);
+                if (!resp || !resp.text) {
+                    console.error("No transcription returned from Whisper");
+                    websocket.send(JSON.stringify({ error: "No transcription returned" }));
+                    return;
+                }
+    
+                console.log("Transcription completed:", resp.text);
+                websocket.send(JSON.stringify({ 
+                    status: "success",
+                    text: resp.text 
+                }));
+    
+
+                // // console.log("Received audio data", message);
+                // const audioBytes = new Uint8Array(message);
+                // console.log("Audio bytes", audioBytes);
+                // const input = {
+                //     audio: [...audioBytes],  // Spread Uint8Array into a regular array
+                // };
+        
+                // const response = await this.env.AI.run("@cf/openai/whisper", input);
+                // console.log("Response", response);
+
+        
+                // console.log("Received audio data", message);
+                // const audioBase64 = Buffer.from(message).toString('base64');
                 // const response = await this.ai.run("@cf/openai/whisper-large-v3-turbo", {
                 //     audio: audioBase64,
                 // });
-                
-                console.log("Transcription: Completed");
-                
-                websocket.send(JSON.stringify({
-                    type: 'transcription',
-                    text: response.text,
-                    status: 'completed'
-                }));
-                
-                this.audioTranscription.push({
-                    role: 'user',
-                    content: response.text
-                });
 
-                console.log("Generating overview...");
+                // const transcriptionText = response;
+
+                // console.log("Transcription: Completed", transcriptionText);
+                
+                // websocket.send(JSON.stringify({
+                //     type: 'transcription',
+                //     text: transcriptionText,
+                //     status: 'completed'
+                // }));
+                
+                // this.audioTranscription.push({
+                //     role: 'user',
+                //     content: response.text
+                // });
+
+                // console.log("Generating overview...");
 
                 
                 
@@ -72,6 +124,59 @@ export class MyDurableObject extends DurableObject {
             
         }
     }
+
+    private createWavBuffer(pcmData: Int16Array, options: { sampleRate: number, numChannels: number, bitDepth: number }): ArrayBuffer {
+        const { sampleRate, numChannels, bitDepth } = options;
+        const bytesPerSample = bitDepth / 8;
+        const blockAlign = numChannels * bytesPerSample;
+        
+        // Create buffer with WAV header
+        const buffer = new ArrayBuffer(44 + pcmData.length * 2);
+        const view = new DataView(buffer);
+        
+        // Helper function to write string to buffer
+        const writeString = (view: DataView, offset: number, string: string) => {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        };
+        
+        // RIFF identifier
+        writeString(view, 0, 'RIFF');
+        // File length
+        view.setUint32(4, 36 + pcmData.length * 2, true);
+        // RIFF type
+        writeString(view, 8, 'WAVE');
+        // Format chunk identifier
+        writeString(view, 12, 'fmt ');
+        // Format chunk length
+        view.setUint32(16, 16, true);
+        // Sample format (raw)
+        view.setUint16(20, 1, true);
+        // Channel count
+        view.setUint16(22, numChannels, true);
+        // Sample rate
+        view.setUint32(24, sampleRate, true);
+        // Byte rate (sample rate * block align)
+        view.setUint32(28, sampleRate * blockAlign, true);
+        // Block align (channel count * bytes per sample)
+        view.setUint16(32, blockAlign, true);
+        // Bits per sample
+        view.setUint16(34, bitDepth, true);
+        // Data chunk identifier
+        writeString(view, 36, 'data');
+        // Data chunk length
+        view.setUint32(40, pcmData.length * 2, true);
+        
+        // Write the PCM data
+        const dataView = new Int16Array(buffer, 44);
+        for (let i = 0; i < pcmData.length; i++) {
+            dataView[i] = pcmData[i];
+        }
+        
+        return buffer;
+    }
+    
     
     async fetch(request: Request): Promise<Response> {
         const webSocketPair = new WebSocketPair();
@@ -81,6 +186,7 @@ export class MyDurableObject extends DurableObject {
         this.webSockets.add(server);
 
         server.addEventListener('message', async (event) => {
+            
             this.handleAudioMessage(server, event.data);
         });
 
