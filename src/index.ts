@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from 'zod';
 import { Buffer } from 'buffer';
-import OpenAI from 'openai';
+import {OpenAI} from 'openai';
 
 
 
@@ -19,7 +19,9 @@ export class MyDurableObject extends DurableObject {
     ai: any;
     audioTranscription: Array<{ role: string; content: string }> = [];
     sql: SqlStorage;
-
+    private audioBuffer: Int16Array[] = [];
+    private transcriptionTimer: NodeJS.Timeout | null = null;
+    
     
     constructor(state: DurableObjectState, env: Env) {
         super(state, env);
@@ -45,6 +47,7 @@ export class MyDurableObject extends DurableObject {
           
                 // console.log("Received audio data", message);
                 // console.log("Type of message", typeof message);
+                
                 const pcmData = new Int16Array(message);
                 const wavBuffer = this.createWavBuffer(pcmData, {
                     sampleRate: 24000,  // Must match client's sample rate
@@ -53,14 +56,34 @@ export class MyDurableObject extends DurableObject {
                 });
                 
                 const audioArray = Array.from(new Uint8Array(wavBuffer));
-                const input = {
-                    audio: audioArray
-                };
-        
+                // const input = {
+                //     audio: audioArray
+                // };
 
-                // const audioData = [...new Uint8Array(message)];
+                const base64Audio = Buffer.from(wavBuffer).toString('base64');
+                const audioBuffer = Buffer.from(base64Audio, 'base64');
+                const file = new File([audioBuffer], 'audio.wav', { type: 'audio/wav' });
+                
+                const input = {
+                        audio: base64Audio
+                    };                    
+                    
+                    const openai = new OpenAI({
+                      apiKey: 'sk-f9562bde68623ce62099a850f1f339715a022bde7745b134',
+                      baseURL: 'https://api.exomlapi.com/v1'
+                    });
+                    
+                    
+                    const transcription = await openai.audio.transcriptions.create({
+                    file: file,
+                    model: "gpt-4o-transcribe",
+                    });
+                    
+                    console.log(transcription.text);
+                    
+                    
     
-                const resp = await this.env.AI.run("@cf/openai/whisper", input);
+                const resp = await this.env.AI.run("@cf/openai/whisper-large-v3-turbo", input);
                 
                 console.log("Response received", resp.text);
                 if (!resp || !resp.text) {
@@ -124,6 +147,7 @@ export class MyDurableObject extends DurableObject {
             
         }
     }
+    
 
     private createWavBuffer(pcmData: Int16Array, options: { sampleRate: number, numChannels: number, bitDepth: number }): ArrayBuffer {
         const { sampleRate, numChannels, bitDepth } = options;
